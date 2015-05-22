@@ -1,0 +1,6 @@
+/build
+/unread
+/.gdb_history
+/.vimrc
+*.swp
+/.ycm_extra*
