@@ -76,7 +76,7 @@ int main(int argc, char *argv[]) {
             }
 
             if(unwind) {
-                printf("Unwind information found.\n");
+                printf("Unwind information found for address 0x%lx.\n", address);
                 if(unwind->state.cfa_expression) {
                     printf("\tCFA is expression, NYI.\n");
                 }
@@ -91,7 +91,7 @@ int main(int argc, char *argv[]) {
                 }
             }
             else {
-                printf("No unwind information found. Follow rbp.\n");
+                printf("No unwind information found for address 0x%lx. Follow rbp.\n", address);
             }
             printf("> ");
         }

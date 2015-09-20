@@ -5,6 +5,8 @@
 //#include "elf/elfmap.h"
 #include "logger.h"
 
+#define DW_STACK_SIZE 8
+
 typedef enum dwarf_encoding {
   DW_EH_PE_absptr = 0x00,
   DW_EH_PE_omit = 0xff,
@@ -366,7 +368,7 @@ static void parse_eh_frame_cie(void *content, size_t len, size_t *offset,
         LOG(ERROR, "CIE has unknown version");
         return;
     }
-    
+
     char aug_str[8] = {};
     char *p = aug_str;
     while((*p = parse_eh_frame_int8(CLE_PARAM))) p ++;
@@ -559,7 +561,7 @@ void load_dwarf_unwind_information(elf_t *elf,
 static unsigned long dwarf_eval_expr(unsigned char *data, size_t data_length,
     unsigned long bp, unsigned long sp, unsigned long ip) {
 
-    unsigned long *stack = malloc(sizeof(unsigned long) * 8);
+    unsigned long *stack = malloc(sizeof(unsigned long) * DW_STACK_SIZE);
     size_t stack_cap = 8;
     size_t stack_ni = 0;
 
@@ -620,6 +622,7 @@ static unsigned long dwarf_eval_expr(unsigned char *data, size_t data_length,
             stack[stack_ni++] = *(unsigned long *)(data + cursor);
             cursor += 8;
             break;
+        /* constants */
         case DW_OP_const1u:
             ensure_space(1);
             stack[stack_ni++] = *(unsigned char *)(data + cursor);
@@ -640,6 +643,26 @@ static unsigned long dwarf_eval_expr(unsigned char *data, size_t data_length,
             stack[stack_ni++] = *(short *)(data + cursor);
             cursor += 2;
             break;
+        /* Stack operations */
+        case DW_OP_dup:
+            assume_space(1);
+            ensure_space(1);
+            stack[stack_ni] = stack[stack_ni-1];
+            stack_ni ++;
+            break;
+        case DW_OP_drop:
+            assume_space(1);
+            stack_ni --;
+            break;
+        case DW_OP_pick: {
+            unsigned char off = *(unsigned char *)(data + cursor);
+            assume_space((int)off+1);
+            stack[stack_ni] = stack[stack_ni-off-1];
+            cursor ++;
+            stack_ni ++;
+            break;
+        }
+        /* Logical operations */
         case DW_OP_and:
             assume_space(2);
             stack[stack_ni-2] &= stack[stack_ni-1];
@@ -650,6 +673,12 @@ static unsigned long dwarf_eval_expr(unsigned char *data, size_t data_length,
             stack[stack_ni-2] <<= stack[stack_ni-1];
             stack_ni --;
             break;
+        case DW_OP_shr:
+            assume_space(2);
+            stack[stack_ni-2] >>= stack[stack_ni-1];
+            stack_ni --;
+            break;
+        /* Comparison operations */
         case DW_OP_ge:
             assume_space(2);
             stack[stack_ni-2] = stack[stack_ni-2] >= stack[stack_ni-1]?1:0;
@@ -756,11 +785,13 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
         }
 
         dwarf_state_t *state = VECTOR_GET_BACK_PTR(dwarf_state_t, state_stack);
+        //LOG(DEBUG, "cfa_ip: 0x%x executing opcode 0x%x", cfa_ip, opcode);
         switch(opcode) {
         case DW_CFA_nop:
             //LOG(DEBUG, "\tNOP");
             break;
         case DW_CFA_set_loc: {
+            LOG(FATAL, "set_loc!!!");
             op1 = parse_eh_frame_int64(cfa, cfa_length, &cursor);
 
             cfa_ip = op1;
@@ -769,7 +800,7 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
         case DW_CFA_advance_loc1: {
             //LOG(DEBUG, "loc1");
             op1 = parse_eh_frame_int8(cfa, cfa_length, &cursor);
-            unsigned long next_ip = cfa_ip = op1*cf;
+            unsigned long next_ip = cfa_ip + op1*cf;
             snapshot_computed_state(unwinds, region, state, cfa_ip,
                 next_ip);
 
@@ -780,9 +811,11 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
         case DW_CFA_advance_loc2: {
             //LOG(DEBUG, "loc2");
             op1 = parse_eh_frame_int16(cfa, cfa_length, &cursor);
-            unsigned long next_ip = cfa_ip = op1*cf;
+            unsigned long next_ip = cfa_ip + op1*cf;
+            //LOG(DEBUG, "Snapshotting!");
             snapshot_computed_state(unwinds, region, state, cfa_ip,
                 next_ip);
+            //LOG(DEBUG, "Snapshotted offset range [0x%x, 0x%x]!", cfa_ip, next_ip);
 
             cfa_ip = next_ip;
             break;
@@ -790,7 +823,7 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
         case DW_CFA_advance_loc4: {
             //LOG(DEBUG, "loc4");
             op1 = parse_eh_frame_int32(cfa, cfa_length, &cursor);
-            unsigned long next_ip = cfa_ip = op1*cf;
+            unsigned long next_ip = cfa_ip + op1*cf;
             snapshot_computed_state(unwinds, region, state, cfa_ip,
                 next_ip);
 
@@ -805,7 +838,7 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
             break;
         }
         case DW_CFA_restore_extended: {
-            LOG(ERROR, "restore not checked yet");
+            LOG(ERROR, "restore extended not checked yet");
             op1 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
             dwarf_state_t *cie_state =
                 VECTOR_GET_PTR(dwarf_state_t, state_stack, 0);
@@ -890,14 +923,16 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
             break;
         }
         case DW_CFA_restore: {
-            LOG(ERROR, "restore not checked yet");
+            //LOG(ERROR, "restore not checked yet");
             dwarf_state_t *cie_state =
                 VECTOR_GET_PTR(dwarf_state_t, state_stack, 0);
+            //LOG(DEBUG, "Restoring register %i to saved state, which is type %i and value %li", op1, cie_state->saved_registers[op1].from, cie_state->saved_registers[op1].value);
             state->saved_registers[op1] = cie_state->saved_registers[op1];
             break;
         }
         default:
             LOG(FATAL, "Unsupported DWARF CFA opcode 0x%x", opcode);
+            break;
         }
         count ++;
     }
@@ -918,6 +953,9 @@ static void precompute_offsets_for(dwarf_unwind_info_t *dinfo,
     VECTOR_INIT(dwarf_state_t, &state_stack);
     VECTOR_RESIZE(dwarf_state_t, &state_stack, 1);
 
+    memset(VECTOR_GET_PTR(dwarf_state_t, &state_stack, 0), 0,
+        sizeof(dwarf_state_t));
+
     run_cfa(&dinfo->precomputed_unwinds, region, region->length+1,
         &state_stack, region->cie->unwind_data,
         region->cie->unwind_data_length, 1);
@@ -927,6 +965,17 @@ static void precompute_offsets_for(dwarf_unwind_info_t *dinfo,
 
     run_cfa(&dinfo->precomputed_unwinds, region, region->length+1,
         &state_stack, region->unwind_data, region->unwind_data_length, 0);
+
+    /*
+    printf("Computed region state\n");
+    printf("State stack size: %i\n", VECTOR_GET_SIZE(dwarf_state_t, &state_stack));
+    printf("Precomputed register sources:");
+    state = VECTOR_GET_BACK_PTR(dwarf_state_t, &state_stack);
+    for(int i = 0; i <= DWARF_RIP; i ++) {
+        printf(" %i", state->saved_registers[i].from);
+    }
+    printf("\n");
+    */
 }
 
 int dwarf_unwind(dwarf_unwind_info_t *dinfo, unsigned long *bp,
@@ -969,7 +1018,18 @@ int dwarf_unwind(dwarf_unwind_info_t *dinfo, unsigned long *bp,
 void compute_offsets(dwarf_unwind_info_t *dinfo) {
     VECTOR_INIT(precomputed_unwind_t, &dinfo->precomputed_unwinds);
     VECTOR_FOR_EACH_PTR(dwarf_unwind_region_t, region, &dinfo->regions) {
+        long size_before =
+            VECTOR_GET_SIZE(precomputed_unwind_t, &dinfo->precomputed_unwinds);
         precompute_offsets_for(dinfo, region);
+        long size_after =
+            VECTOR_GET_SIZE(precomputed_unwind_t, &dinfo->precomputed_unwinds);
+
+        if(size_before != size_after) {
+            precomputed_unwind_t *unwind =
+                VECTOR_GET_BACK_PTR(precomputed_unwind_t,
+                    &dinfo->precomputed_unwinds);
+            unwind->length = region->base + region->length - unwind->ip;
+        }
     }
 }
 
