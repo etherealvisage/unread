@@ -33,13 +33,16 @@ typedef enum register_index {
     DWARF_R13,
     DWARF_R14,
     DWARF_R15,
-    DWARF_RIP
+    DWARF_RIP,
+    DWARF_REGS
 } register_index;
 
 typedef struct dwarf_state_t {
     struct {
         int from;
         unsigned long value;
+        unsigned char *expression;
+        unsigned long expression_length;
     } saved_registers[NUM_REGISTERS];
 
     // if cfa_expression == NULL, then use cfa_register/offset
@@ -76,8 +79,10 @@ void load_dwarf_unwind_information(elf_t *elf,
 void compute_offsets(dwarf_unwind_info_t *dinfo);
 void disassemble(dwarf_unwind_info_t *dinfo);
 
-int dwarf_unwind(dwarf_unwind_info_t *dinfo, unsigned long *bp,
-    unsigned long *sp, unsigned long *ip);
+/*int dwarf_unwind(dwarf_unwind_info_t *dinfo, unsigned long *bp,
+    unsigned long *sp, unsigned long *ip);*/
+
+int dwarf_unwind(dwarf_unwind_info_t *dinfo, unsigned long *regs);
 
 extern const char *dwarf_regnames[];
 

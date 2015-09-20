@@ -559,7 +559,7 @@ void load_dwarf_unwind_information(elf_t *elf,
     if(stack_ni < 2) LOG(FATAL, "Need at least %i elements on stack", count)
 
 static unsigned long dwarf_eval_expr(unsigned char *data, size_t data_length,
-    unsigned long bp, unsigned long sp, unsigned long ip) {
+    unsigned long *regs) {
 
     unsigned long *stack = malloc(sizeof(unsigned long) * DW_STACK_SIZE);
     size_t stack_cap = 8;
@@ -580,18 +580,12 @@ static unsigned long dwarf_eval_expr(unsigned char *data, size_t data_length,
         else if(op >= DW_OP_reg0 && op <= DW_OP_reg31) {
             ensure_space(1);
             unsigned long reg = op - DW_OP_reg0;
-            if(reg == 6) { 
-                stack[stack_ni++] = bp;
+            if(reg >= DWARF_REGS) {
+                LOG(ERROR, "Requested access to invalid register %i",
+                    op - DW_OP_reg0);
             }
-            else if(reg == 7) {
-                stack[stack_ni++] = sp;
-            }
-            else if(reg == 16) {
-                stack[stack_ni++] = ip;
-            }
-            else {
-                LOG(ERROR, "Need access to register %i", op - DW_OP_reg0);
-            }
+            else stack[stack_ni++] = regs[reg];
+
             continue;
         }
         /* register offsets */
@@ -599,18 +593,13 @@ static unsigned long dwarf_eval_expr(unsigned char *data, size_t data_length,
             ensure_space(1);
             long off = parse_eh_frame_sleb(data, data_length, &cursor);
             unsigned long reg = op - DW_OP_reg0;
-            if(reg == 6) { 
-                stack[stack_ni++] = bp + off;
+
+            if(reg >= DWARF_REGS) {
+                LOG(ERROR, "Requested offset from invalid register %i",
+                    op - DW_OP_reg0);
             }
-            else if(reg == 7) {
-                stack[stack_ni++] = sp + off;
-            }
-            else if(reg == 16) {
-                stack[stack_ni++] = ip + off;
-            }
-            else {
-                LOG(ERROR, "Need access to register %i", op - DW_OP_reg0);
-            }
+            else stack[stack_ni++] = regs[reg] + off;
+
             continue;
         }
         
@@ -902,7 +891,24 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
             unsigned long length = parse_eh_frame_uleb(cfa, cfa_length,
                 &offset);
 
-            LOG(FATAL, "DW_CFA_expression NYI");
+            state->saved_registers[op1].from = REG_ATEXP;
+            state->saved_registers[op1].expression = cfa + cursor;
+            state->saved_registers[op1].expression_length = length;
+
+            cursor = offset + length;
+            break;
+        }
+        case DW_CFA_val_expression: {
+            op1 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
+            op2 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
+
+            unsigned long offset = cursor;
+            unsigned long length = parse_eh_frame_uleb(cfa, cfa_length,
+                &offset);
+
+            state->saved_registers[op1].from = REG_ISEXP;
+            state->saved_registers[op1].expression = cfa + cursor;
+            state->saved_registers[op1].expression_length = length;
 
             cursor = offset + length;
             break;
@@ -978,41 +984,66 @@ static void precompute_offsets_for(dwarf_unwind_info_t *dinfo,
     */
 }
 
-int dwarf_unwind(dwarf_unwind_info_t *dinfo, unsigned long *bp,
-    unsigned long *sp, unsigned long *ip) {
-#if 0
+int dwarf_unwind(dwarf_unwind_info_t *dinfo, unsigned long *regs) {
+    unsigned long ip = regs[DWARF_RIP];
 
     // TODO: replace this linear search with an appropriate binary search
-
     precomputed_unwind_t *unwind = NULL;
     VECTOR_FOR_EACH_PTR(precomputed_unwind_t, u, &dinfo->precomputed_unwinds) {
-        if(*ip >= u->ip && *ip <= u->ip + u->length) { unwind = u; break; }
+        if(ip >= u->ip && ip <= u->ip + u->length) { unwind = u; break; }
     }
     
     if(unwind == NULL) return 0;
 
-    if(unwind->sp_is_expr) {
-        *sp = dwarf_eval_expr(unwind->sp.expr.expression,
-            unwind->sp.expr.length, *bp, *sp, *ip);
+    unsigned long cfa = 0;
+    if(unwind->state.cfa_expression) {
+        cfa = dwarf_eval_expr(unwind->state.cfa_expression,
+            unwind->state.cfa_expression_length, regs);
     }
     else {
-        switch(unwind->sp.reg.reg) {
-        case 6: *sp = *bp;
-        case 16: *sp = *ip;
-        default:
-            LOG(FATAL, "unknown register");
-            break;
-        }
-        *sp += unwind->sp.reg.off;
+        cfa = regs[unwind->state.cfa_register] + unwind->state.cfa_offset;
     }
 
-    *bp = *sp + unwind->bp_offset;
-    *ip = *sp + unwind->ip_offset;
+    unsigned long saved_regs[DWARF_REGS];
+    for(int i = 0; i < DWARF_REGS; i ++) {
+        saved_regs[i] = regs[i];
+    }
+    for(int i = 0; i < DWARF_REGS; i ++) {
+        unsigned long value = unwind->state.saved_registers[i].value;
+        switch(unwind->state.saved_registers[i].from) {
+        case REG_UNUSED:
+            break;
+        case REG_CFA:
+            // XXX: memory access
+            regs[i] = *(unsigned long *)(cfa + value);
+            break;
+        case REG_OFFSET_CFA:
+            regs[i] = cfa + value;
+            break;
+        case REG_REG:
+            regs[i] = saved_regs[value];
+            break;
+        case REG_ATEXP:
+            // XXX: memory access
+            regs[i] = *(unsigned long *)dwarf_eval_expr(
+                unwind->state.saved_registers[i].expression,
+                unwind->state.saved_registers[i].expression_length,
+                saved_regs);
+            break;
+        case REG_ISEXP:
+            regs[i] = dwarf_eval_expr(
+                unwind->state.saved_registers[i].expression,
+                unwind->state.saved_registers[i].expression_length,
+                saved_regs);
+            break;
+        default:
+            LOG(FATAL, "Unknown register source %i",
+                unwind->state.saved_registers[i].from);
+            break;
+        }
+    }
 
     return 1;
-#else
-    return 0;
-#endif
 }
 
 void compute_offsets(dwarf_unwind_info_t *dinfo) {
