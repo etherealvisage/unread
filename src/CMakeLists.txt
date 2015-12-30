@@ -1,4 +1,4 @@
-add_definitions(-Wextra -Wall -std=c99)
+add_definitions(-Wextra -Wall -std=c99 -g)
 add_definitions(-D_GNU_SOURCE -Wno-unused-parameter)
 
 aux_source_directory(. dot_sources)

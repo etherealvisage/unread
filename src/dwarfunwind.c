@@ -294,17 +294,19 @@ static unsigned long parse_eh_frame_uleb(void *content, size_t len,
     unsigned long result = 0;
 
     unsigned shift = 0;
-    do {
+    while(1) {
         unsigned long next = parse_eh_frame_int8(CLE_PARAM);
         result |= (next & 0x7f) << shift;
         shift += 7;
-        if(next & 0x80) continue;
-    } while(0);
+        if((next & 0x80) == 0) {
+            break;
+        }
+    }
 
     return result;
 }
 
-static unsigned long parse_eh_frame_sleb(void *content, size_t len,
+static long parse_eh_frame_sleb(void *content, size_t len,
     size_t *offset) {
 
     unsigned long result = 0;
@@ -371,11 +373,22 @@ static void parse_eh_frame_cie(void *content, size_t len, size_t *offset,
 
     char aug_str[8] = {};
     char *p = aug_str;
-    while((*p = parse_eh_frame_int8(CLE_PARAM))) p ++;
+    while((*p = parse_eh_frame_int8(CLE_PARAM))) {
+        p ++;
+    }
 
     cie->lsda_encoding = DW_EH_PE_omit;
     cie->fde_encoding = DW_EH_PE_absptr;
     cie->is_signal = 0;
+
+    cie->code_factor = parse_eh_frame_uleb(CLE_PARAM);
+    cie->data_factor = parse_eh_frame_sleb(CLE_PARAM);
+
+    // ret register is uint8 in version 1, uleb in version 3
+    if(version == 1)
+        cie->ret_register = parse_eh_frame_int8(CLE_PARAM);
+    else
+        cie->ret_register = parse_eh_frame_uleb(CLE_PARAM);
 
     //int have_length = 0;
     unsigned long aug_end = 0;
@@ -389,21 +402,6 @@ static void parse_eh_frame_cie(void *content, size_t len, size_t *offset,
         // XXX: support this as long as all the present chars are known
         LOG(FATAL, "No augmentation length specified");
     }
-
-    cie->code_factor = parse_eh_frame_uleb(CLE_PARAM);
-    cie->data_factor = parse_eh_frame_sleb(CLE_PARAM);
-
-    // These are the values that GCC uses to generate this information.
-    // For some reason, they aren't being parsed correctly right now...
-    // TODO: figure out why
-    cie->code_factor = 1;
-    cie->data_factor = -8;
-
-    // ret register is uint8 in version 1, uleb in version 3
-    if(version == 1)
-        cie->ret_register = parse_eh_frame_int8(CLE_PARAM);
-    else
-        cie->ret_register = parse_eh_frame_uleb(CLE_PARAM);
 
     aug_end += *offset;
 
@@ -424,7 +422,7 @@ static void parse_eh_frame_cie(void *content, size_t len, size_t *offset,
                 cie->personality_encoding);
             break;
         default:
-            LOG(ERROR, "Unknown CIE augmentation char '%c'", *p);
+            LOG(FATAL, "Unknown CIE augmentation char '%c'", *p);
             break;
         }
         p ++;
@@ -443,7 +441,7 @@ static void parse_eh_frame_fde(dwarf_unwind_info_t *dinfo,
     dwarf_unwind_region_t region;
 
     if((cie->fde_encoding & DW_EH_PE_pcrel) == 0) {
-        LOG(FATAL, "FDE encoding not PC-relative!");
+        LOG(FATAL, "FDE encoding not PC-relative! (is %d)", cie->fde_encoding);
     }
 
     // PC-relative value
@@ -483,6 +481,7 @@ static void parse_eh_frame(dwarf_unwind_info_t *dinfo, unsigned long map_base,
         unsigned long length = parse_eh_frame_entry_len(content, len, &offset);
         if(length == 0) break;
 
+        LOG(DEBUG, "starting offset: 0x%x", offset);
         unsigned long start_offset = offset;
         unsigned long end_offset = start_offset + length;
 
@@ -768,6 +767,7 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
 
         unsigned char opcode = cfa[cursor++];
         unsigned long op1 = 0, op2 = 0;
+        long sop1 = 0, sop2 = 0;
         if(opcode & 0xc0) {
             op1 = opcode & 0x3f;
             opcode &= 0xc0;
@@ -780,7 +780,7 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
             //LOG(DEBUG, "\tNOP");
             break;
         case DW_CFA_set_loc: {
-            LOG(FATAL, "set_loc!!!");
+            //LOG(FATAL, "set_loc!!!");
             op1 = parse_eh_frame_int64(cfa, cfa_length, &cursor);
 
             cfa_ip = op1;
@@ -849,6 +849,11 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
             break;
         }
         case DW_CFA_remember_state: {
+            if(VECTOR_GET_SIZE(dwarf_state_t, state_stack)
+                == state_stack->alloc) {
+
+                LOG(FATAL, "DWARF stack size exceeded");
+            }
             VECTOR_PUSH(dwarf_state_t, state_stack, *state);
             break;
         }
@@ -898,9 +903,48 @@ static void run_cfa(VECTOR_TYPE(precomputed_unwind_t) *unwinds,
             cursor = offset + length;
             break;
         }
-        case DW_CFA_val_expression: {
+        case DW_CFA_offset_extended_sf: {
+            op1 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
+            sop2 = parse_eh_frame_sleb(cfa, cfa_length, &cursor);
+
+            state->saved_registers[op1].from = REG_CFA;
+            state->saved_registers[op1].value = sop2 * df;
+
+            LOG(WARN, "DW_CFA_offset_extended_sf untested");
+            break;
+        }
+        case DW_CFA_def_cfa_sf: {
+            op1 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
+            sop2 = parse_eh_frame_sleb(cfa, cfa_length, &cursor);
+            state->cfa_register = op1;
+            state->cfa_offset = sop2 * df;
+            LOG(WARN, "DW_CFA_def_cfa_sf untested");
+            break;
+        }
+        case DW_CFA_def_cfa_offset_sf: {
+            sop1 = parse_eh_frame_sleb(cfa, cfa_length, &cursor);
+            state->cfa_offset = sop1 * df;
+            LOG(WARN, "DW_CFA_def_cfa_offset_sf untested");
+            break;
+        }
+        case DW_CFA_val_offset: {
             op1 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
             op2 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
+            state->saved_registers[op1].from = REG_OFFSET_CFA;
+            state->saved_registers[op1].value = op2 * df;
+            LOG(WARN, "DW_CFA_val_offset untested");
+            break;
+        }
+        case DW_CFA_val_offset_sf: {
+            op1 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
+            sop2 = parse_eh_frame_sleb(cfa, cfa_length, &cursor);
+            state->saved_registers[op1].from = REG_OFFSET_CFA;
+            state->saved_registers[op1].value = op2 * df;
+            LOG(WARN, "DW_CFA_val_offset_sf untested");
+            break;
+        }
+        case DW_CFA_val_expression: {
+            op1 = parse_eh_frame_uleb(cfa, cfa_length, &cursor);
 
             unsigned long offset = cursor;
             unsigned long length = parse_eh_frame_uleb(cfa, cfa_length,
@@ -957,6 +1001,8 @@ static void precompute_offsets_for(dwarf_unwind_info_t *dinfo,
     
     VECTOR_TYPE(dwarf_state_t) state_stack;
     VECTOR_INIT(dwarf_state_t, &state_stack);
+    // XXX: this limit should not be exceeded, checked for in remember_state
+    VECTOR_RESERVE(dwarf_state_t, &state_stack, 16);
     VECTOR_RESIZE(dwarf_state_t, &state_stack, 1);
 
     memset(VECTOR_GET_PTR(dwarf_state_t, &state_stack, 0), 0,
