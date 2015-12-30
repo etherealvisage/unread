@@ -313,12 +313,12 @@ static long parse_eh_frame_sleb(void *content, size_t len,
 
     unsigned shift = 0;
     unsigned long next;
-    do {
+    while(1) {
         next = parse_eh_frame_int8(CLE_PARAM);
         result |= (next & 0x7f) << shift;
         shift += 7;
-        if(next & 0x80) continue;
-    } while(0);
+        if((next & 0x80) == 0) break;
+    }
 
     if(shift < 128 && (next & 0x40)) {
         result |= - (1ull<<shift);
